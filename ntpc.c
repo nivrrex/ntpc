@@ -193,7 +193,7 @@ double get_offset(const struct ntphdr *ntp, const struct timeval *recvtv)
 
 void usage(void)
 {
-    fprintf(stderr, "Usage:\nntpc pool.ntp.org \n");
+    fprintf(stderr, "Usage:\nntpc pool.ntp.org \nntpc ntp.aliyun.com\n");
 }
 
 int main(int argc, char *argv[])
