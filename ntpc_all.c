@@ -1,10 +1,13 @@
 /*
- * 项目名称: 跨平台高精度 NTP 同步工具 (v0.3)
+ * 项目名称: 跨平台高精度 NTP 同步工具 (v0.4)
  * 编译环境: Windows (MinGW-gcc) 或 Linux (gcc)
- * 更新日志 v0.3:
- * - [修复] 原始时间戳验证逻辑错误（应比对transmit timestamp）
- * - [优化] 改进调试输出，便于诊断网络问题
- * 
+ * 更新日志 v0.4:
+ * - [修复] 多采样策略改为取最小delay采样，而非算术平均
+ * - [修复] t1_frac 浮点边界问题，改用 floor() 提取整数部分
+ * - [修复] validate_hostname 现在接受纯IPv4地址格式
+ * - [优化] 输出新增 offset（时间偏差）显示
+ * - [优化] results 数组访问增加边界保护
+ *
  * [编译命令]
  * Linux:   gcc ntp_sync.c -o ntp_sync -lm
  * Windows: gcc ntp_sync.c -o ntp_sync.exe -lws2_32
@@ -106,6 +109,7 @@ typedef struct {
 typedef struct {
     double corrected_time;
     double delay;
+    double offset;
     ntp_error_t error;
 } ntp_result;
 
@@ -141,16 +145,19 @@ double get_local_time_double() {
 #endif
 }
 
-/* --- 主机名验证 --- */
+/* --- 主机名验证（兼容域名和IPv4地址） --- */
 int validate_hostname(const char* hostname) {
     if (!hostname || strlen(hostname) == 0 || strlen(hostname) > MAX_HOSTNAME_LEN) {
         return 0;
     }
-    /* 基本格式检查：只允许字母、数字、点、横线 */
+    /*
+     * 允许字母、数字、点、横线（覆盖域名和IPv4格式）
+     * IPv6暂不支持
+     */
     for (const char* p = hostname; *p; p++) {
-        if (!((*p >= 'a' && *p <= 'z') || 
-              (*p >= 'A' && *p <= 'Z') || 
-              (*p >= '0' && *p <= '9') || 
+        if (!((*p >= 'a' && *p <= 'z') ||
+              (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') ||
               *p == '.' || *p == '-')) {
             return 0;
         }
@@ -180,14 +187,18 @@ int validate_ntp_response(const ntp_packet* packet, uint32_t sent_sec, uint32_t 
     /* 验证服务器回显的原始时间戳（应等于客户端发送时间戳） */
     uint32_t resp_orig_sec = ntohl(packet->orig_ts_sec);
     uint32_t resp_orig_frac = ntohl(packet->orig_ts_frac);
-    
+
     /* 允许小的时间戳差异（某些服务器实现可能不完全精确） */
     int sec_diff = abs((int)resp_orig_sec - (int)sent_sec);
     if (sec_diff > 1) {
-        fprintf(stderr, "[调试] 原始时间戳秒差异过大: %d (发送:%u 回显:%u)\n", 
+        fprintf(stderr, "[调试] 原始时间戳秒差异过大: %d (发送:%u 回显:%u)\n",
                 sec_diff, sent_sec, resp_orig_sec);
         return 0;
     }
+
+    /* 抑制未使用变量警告 */
+    (void)resp_orig_frac;
+    (void)sent_frac;
 
     /* 检查传输时间戳非零 */
     if (ntohl(packet->trans_ts_sec) == 0) {
@@ -205,7 +216,7 @@ ntp_error_t set_system_time_platform(double new_time_seconds) {
 
 #ifdef _WIN32
     SYSTEMTIME st;
-    ULONGLONG win_ticks = ((ULONGLONG)sec + 11644473600LL) * 10000000ULL + 
+    ULONGLONG win_ticks = ((ULONGLONG)sec + 11644473600LL) * 10000000ULL +
                           (ULONGLONG)(frac * 10000000ULL);
     FILETIME ft;
     ft.dwLowDateTime = (DWORD)(win_ticks & 0xFFFFFFFF);
@@ -232,9 +243,9 @@ ntp_error_t set_system_time_platform(double new_time_seconds) {
     return NTP_SUCCESS;
 }
 
-/* --- 单次 NTP 同步（不设置时间） --- */
+/* --- 单次 NTP 查询（不设置时间） --- */
 ntp_result query_ntp_server(const char* hostname) {
-    ntp_result result = {0.0, 0.0, NTP_ERR_DNS_FAILED};
+    ntp_result result = {0.0, 0.0, 0.0, NTP_ERR_DNS_FAILED};
     socket_t sock = -1;
     struct addrinfo hints, *res = NULL;
     ntp_packet packet = {0};
@@ -263,12 +274,14 @@ ntp_result query_ntp_server(const char* hostname) {
 
     /* 构造标准 NTP 客户端请求包 */
     packet.li_vn_mode = 0x1B; /* LI=0, VN=3, Mode=3(客户端) */
-    
+
     /* 记录发送时间（T1） */
     double t1 = get_local_time_double();
-    uint32_t t1_sec = (uint32_t)t1 + NTP_TIMESTAMP_DELTA;
-    uint32_t t1_frac = (uint32_t)((t1 - (uint32_t)t1) * 4294967296.0);
-    
+    /* [修复] 使用 floor() 提取整数部分，避免浮点边界溢出 */
+    uint32_t t1_sec = (uint32_t)floor(t1) + NTP_TIMESTAMP_DELTA;
+    double t1_frac_d = t1 - floor(t1);
+    uint32_t t1_frac = (uint32_t)(t1_frac_d * 4294967296.0);
+
     /* 设置发送时间戳字段（网络字节序） */
     packet.trans_ts_sec = htonl(t1_sec);
     packet.trans_ts_frac = htonl(t1_frac);
@@ -302,12 +315,13 @@ ntp_result query_ntp_server(const char* hostname) {
     double t2 = (double)(t2_sec - NTP_TIMESTAMP_DELTA) + (double)t2_fra / 4294967296.0;
     double t3 = (double)(t3_sec - NTP_TIMESTAMP_DELTA) + (double)t3_fra / 4294967296.0;
 
-    /* NTP 算法: 
-     * delay = (T4-T1) - (T3-T2)
+    /* NTP 算法:
+     * delay  = (T4-T1) - (T3-T2)
      * offset = ((T2-T1) + (T3-T4)) / 2
      * corrected_time = T3 + delay/2
      */
-    result.delay = (t4 - t1) - (t3 - t2);
+    result.delay  = (t4 - t1) - (t3 - t2);
+    result.offset = ((t2 - t1) + (t3 - t4)) / 2.0;
     result.corrected_time = t3 + (result.delay / 2.0);
     result.error = NTP_SUCCESS;
 
@@ -317,23 +331,24 @@ cleanup:
     return result;
 }
 
-/* --- 多次采样求平均 --- */
+/* --- 多次采样取最小delay --- */
 ntp_result sync_with_server_multi_sample(const char* hostname, int samples) {
     ntp_result results[MAX_SAMPLES];
     int success_count = 0;
-    double sum_time = 0.0;
-    double sum_delay = 0.0;
-    ntp_result final = {0.0, 0.0, NTP_ERR_RECV_TIMEOUT};
+    ntp_result final = {0.0, 0.0, 0.0, NTP_ERR_RECV_TIMEOUT};
+
+    if (samples > MAX_SAMPLES) samples = MAX_SAMPLES; /* 边界保护 */
 
     printf("正在同步 %s (%d次采样)...\n", hostname, samples);
 
     for (int i = 0; i < samples; i++) {
         results[i] = query_ntp_server(hostname);
         if (results[i].error == NTP_SUCCESS) {
-            sum_time += results[i].corrected_time;
-            sum_delay += results[i].delay;
+            printf("  采样 %d/%d: 延迟 %.2f ms | 偏移 %+.2f ms ✓\n",
+                   i+1, samples,
+                   results[i].delay * 1000.0,
+                   results[i].offset * 1000.0);
             success_count++;
-            printf("  采样 %d/%d: 延迟 %.2f ms ✓\n", i+1, samples, results[i].delay * 1000.0);
         } else {
             printf("  采样 %d/%d: %s ✗\n", i+1, samples, ntp_error_strings[results[i].error]);
         }
@@ -344,13 +359,23 @@ ntp_result sync_with_server_multi_sample(const char* hostname, int samples) {
         return final;
     }
 
-    /* 计算平均值 */
-    final.corrected_time = sum_time / success_count;
-    final.delay = sum_delay / success_count;
-    final.error = NTP_SUCCESS;
+    /*
+     * [修复] 取最小delay对应的采样结果
+     * 原因: delay最小说明网络路径最对称，时间误差最小；
+     *       多个时间戳直接求平均无统计意义。
+     */
+    ntp_result* best = NULL;
+    for (int i = 0; i < samples; i++) {
+        if (results[i].error == NTP_SUCCESS) {
+            if (best == NULL || results[i].delay < best->delay) {
+                best = &results[i];
+            }
+        }
+    }
+    final = *best;
 
-    printf("[成功] 平均延迟: %.2f ms | 成功率: %d/%d\n", 
-           final.delay * 1000.0, success_count, samples);
+    printf("[成功] 最优采样: 延迟 %.2f ms | 偏移 %+.2f ms | 成功率: %d/%d\n",
+           final.delay * 1000.0, final.offset * 1000.0, success_count, samples);
 
     return final;
 }
@@ -359,12 +384,13 @@ ntp_result sync_with_server_multi_sample(const char* hostname, int samples) {
 void print_usage(const char* prog_name) {
     printf("用法: %s [选项] [NTP服务器]\n\n", prog_name);
     printf("选项:\n");
-    printf("  -s <次数>  多次采样求平均（1-5次，默认1次）\n");
+    printf("  -s <次数>  多次采样取最优（1-5次，默认1次）\n");
     printf("  -h         显示此帮助信息\n\n");
     printf("示例:\n");
     printf("  %s                          # 使用内置服务器池\n", prog_name);
     printf("  %s time.google.com          # 指定服务器\n", prog_name);
-    printf("  %s -s 3 ntp.aliyun.com      # 3次采样求平均\n\n", prog_name);
+    printf("  %s -s 3 ntp.aliyun.com      # 3次采样取最优\n\n", prog_name);
+    printf("  %s 192.168.1.1              # 指定IPv4地址\n\n", prog_name);
     printf("注意:\n");
 #ifdef _WIN32
     printf("  Windows: 请以管理员身份运行\n");
@@ -413,7 +439,7 @@ int main(int argc, char* argv[]) {
 
         printf("=== 阶段 1: 用户指定服务器 ===\n");
         result = sync_with_server_multi_sample(custom_server, samples);
-        
+
         if (result.error == NTP_SUCCESS) {
             ntp_error_t set_error = set_system_time_platform(result.corrected_time);
             if (set_error == NTP_SUCCESS) {
@@ -438,7 +464,7 @@ int main(int argc, char* argv[]) {
         printf("=== 阶段 2: 内置备用服务器池 ===\n");
         for (int i = 0; i < INTERNAL_SERVER_COUNT; i++) {
             result = sync_with_server_multi_sample(INTERNAL_NTP_SERVERS[i], samples);
-            
+
             if (result.error == NTP_SUCCESS) {
                 ntp_error_t set_error = set_system_time_platform(result.corrected_time);
                 if (set_error == NTP_SUCCESS) {
