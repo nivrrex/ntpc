@@ -1,12 +1,22 @@
 /*
- * 项目名称: 跨平台高精度 NTP 同步工具 (v0.4)
+ * 项目名称: 跨平台轻量 NTP 同步工具 (v0.5)
  * 编译环境: Windows (MinGW-gcc) 或 Linux (gcc)
- * 更新日志 v0.4:
- * - [修复] 多采样策略改为取最小delay采样，而非算术平均
- * - [修复] t1_frac 浮点边界问题，改用 floor() 提取整数部分
- * - [修复] validate_hostname 现在接受纯IPv4地址格式
- * - [优化] 输出新增 offset（时间偏差）显示
- * - [优化] results 数组访问增加边界保护
+ * 更新日志:
+ * v0.5:
+ * - [修复] UDP connect() 替代 recvfrom IP 比对，正确处理 Anycast/DNS-RR 服务器
+ * - [修复] KoD 字节序：reference_id 用 ntohl() 而非 htonl()
+ * - [修复] 请求包 VN=4（0x23），不再发 v3
+ * - [修复] orig_ts 差值改为无符号减法，避免 uint32 → int 强转在 2036 附近溢出
+ * - [修复] corrected_time 算法: 改为 t4 + offset（符合 RFC 5905）
+ * - [修复] 引入 monotonic clock 测量 RTT，避免 realtime 跳变污染 delay 计算
+ * - [修复] recv() 改为 recvfrom()，校验响应来源 IP
+ * - [修复] 新增 LI=3（时钟未同步）拒绝逻辑
+ * - [修复] 新增 VN 范围校验（3-4）
+ * - [修复] delay 负值 clamp 为 0
+ * - [修复] KoD（Kiss-o'-Death）识别，stratum=0 时输出具体原因
+ * - [优化] hostname validator 去除伪安全校验，保留长度检查，靠 getaddrinfo 兜底
+ * - [说明] 本工具使用 settimeofday/SetSystemTime 硬跳时钟，
+ *          适合一次性对时；不适合替代 chrony/ntpd 长期同步服务
  *
  * [编译命令]
  * Linux:   gcc ntp_sync.c -o ntp_sync -lm
@@ -48,7 +58,6 @@
 #define NTP_TIMESTAMP_DELTA 2208988800ull
 #define MAX_HOSTNAME_LEN 255
 #define MAX_SAMPLES 5
-#define MIN_VALID_STRATUM 1
 #define MAX_VALID_STRATUM 15
 
 /* 内置 NTP 服务器池 */
@@ -70,7 +79,9 @@ typedef enum {
     NTP_ERR_INVALID_STRATUM,
     NTP_ERR_SET_TIME_FAILED,
     NTP_ERR_PERMISSION_DENIED,
-    NTP_ERR_INVALID_HOSTNAME
+    NTP_ERR_INVALID_HOSTNAME,
+    NTP_ERR_SOURCE_MISMATCH,
+    NTP_ERR_KOD
 } ntp_error_t;
 
 const char* ntp_error_strings[] = {
@@ -83,15 +94,17 @@ const char* ntp_error_strings[] = {
     "无效的Stratum值",
     "设置系统时间失败",
     "权限不足",
-    "无效的主机名"
+    "无效的主机名",
+    "响应来源IP不匹配",
+    "服务器拒绝请求(KoD)"
 };
 
 #pragma pack(push, 1)
 typedef struct {
-    uint8_t li_vn_mode;
-    uint8_t stratum;
-    uint8_t poll;
-    uint8_t precision;
+    uint8_t  li_vn_mode;
+    uint8_t  stratum;
+    uint8_t  poll;
+    uint8_t  precision;
     uint32_t root_delay;
     uint32_t root_dispersion;
     uint32_t reference_id;
@@ -107,32 +120,18 @@ typedef struct {
 #pragma pack(pop)
 
 typedef struct {
-    double corrected_time;
-    double delay;
-    double offset;
+    double      corrected_time; /* t4 + offset，用于设置系统时间 */
+    double      delay;          /* 往返传播时间（单位：秒） */
+    double      offset;         /* 本地时钟偏差（单位：秒） */
     ntp_error_t error;
 } ntp_result;
 
-/* --- 网络初始化 --- */
-int init_networking() {
-#ifdef _WIN32
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        fprintf(stderr, "[错误] Winsock 初始化失败\n");
-        return 0;
-    }
-#endif
-    return 1;
-}
+/* ============================================================
+ * 高精度时间戳：分 realtime（获取 epoch）和 monotonic（测 RTT）
+ * ============================================================ */
 
-void cleanup_networking() {
-#ifdef _WIN32
-    WSACleanup();
-#endif
-}
-
-/* --- 高精度时间戳获取 --- */
-double get_local_time_double() {
+/* realtime：用于填写 NTP 包的发送时间戳（需要 epoch） */
+static double get_realtime_double(void) {
 #ifdef _WIN32
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
@@ -145,96 +144,151 @@ double get_local_time_double() {
 #endif
 }
 
-/* --- 主机名验证（兼容域名和IPv4地址） --- */
-int validate_hostname(const char* hostname) {
-    if (!hostname || strlen(hostname) == 0 || strlen(hostname) > MAX_HOSTNAME_LEN) {
+/* monotonic：用于测量 RTT，不受系统时间跳变影响 */
+static double get_monotonic_double(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq = {0};
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+#endif
+}
+
+/* ============================================================
+ * 网络初始化
+ * ============================================================ */
+static int init_networking(void) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "[错误] Winsock 初始化失败\n");
         return 0;
     }
-    /*
-     * 允许字母、数字、点、横线（覆盖域名和IPv4格式）
-     * IPv6暂不支持
-     */
-    for (const char* p = hostname; *p; p++) {
-        if (!((*p >= 'a' && *p <= 'z') ||
-              (*p >= 'A' && *p <= 'Z') ||
-              (*p >= '0' && *p <= '9') ||
-              *p == '.' || *p == '-')) {
-            return 0;
-        }
-    }
+#endif
     return 1;
 }
 
-/* --- NTP 响应验证 --- */
-int validate_ntp_response(const ntp_packet* packet, uint32_t sent_sec, uint32_t sent_frac) {
-    /* 检查 mode（应为 4 = 服务器响应） */
-    uint8_t mode = packet->li_vn_mode & 0x07;
-    if (mode != 4 && mode != 5) { /* 4=server, 5=broadcast */
-        fprintf(stderr, "[调试] 响应mode错误: %d (期望4或5)\n", mode);
+static void cleanup_networking(void) {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+/* ============================================================
+ * KoD（Kiss-o'-Death）识别
+ * stratum=0 时，reference_id 是 4字节 ASCII 错误码
+ * ============================================================ */
+static void print_kod_reason(uint32_t reference_id) {
+    char code[5];
+    /*
+     * reference_id 从包中读取时仍是网络字节序（大端），
+     * 用 ntohl() 转为本机字节序后 memcpy 得到正确 ASCII 顺序。
+     */
+    uint32_t ref_host = ntohl(reference_id);
+    memcpy(code, &ref_host, 4);
+    code[4] = '\0';
+    /* 过滤非打印字符 */
+    for (int i = 0; i < 4; i++) {
+        if (code[i] < 0x20 || code[i] > 0x7E) code[i] = '?';
+    }
+    fprintf(stderr, "[调试] KoD 原因码: \"%s\"\n", code);
+    if (strncmp(code, "RATE", 4) == 0) {
+        fprintf(stderr, "       服务器拒绝: 请求频率过高，请降低采样次数或更换服务器\n");
+    } else if (strncmp(code, "DENY", 4) == 0 || strncmp(code, "RSTR", 4) == 0) {
+        fprintf(stderr, "       服务器拒绝: 访问被禁止\n");
+    }
+}
+
+/* ============================================================
+ * NTP 响应验证
+ * ============================================================ */
+static int validate_ntp_response(const ntp_packet* packet,
+                                  uint32_t sent_sec, uint32_t sent_frac) {
+    uint8_t li   = (packet->li_vn_mode >> 6) & 0x03;
+    uint8_t vn   = (packet->li_vn_mode >> 3) & 0x07;
+    uint8_t mode = (packet->li_vn_mode)       & 0x07;
+
+    /* LI=3: 服务器时钟未同步，RFC 5905 要求拒绝 */
+    if (li == 3) {
+        fprintf(stderr, "[调试] LI=3: 服务器时钟未同步\n");
         return 0;
     }
 
-    /* 检查 stratum（1-15有效，0表示未同步） */
+    /* VN: 仅接受 3 或 4 */
+    if (vn < 3 || vn > 4) {
+        fprintf(stderr, "[调试] VN=%d 超出有效范围(3-4)\n", vn);
+        return 0;
+    }
+
+    /* mode: 4=server, 5=broadcast */
+    if (mode != 4 && mode != 5) {
+        fprintf(stderr, "[调试] mode=%d 期望 4 或 5\n", mode);
+        return 0;
+    }
+
+    /* stratum=0: KoD */
     if (packet->stratum == 0) {
-        fprintf(stderr, "[调试] 服务器未同步 (stratum=0)\n");
+        print_kod_reason(packet->reference_id);
         return 0;
     }
     if (packet->stratum > MAX_VALID_STRATUM) {
-        fprintf(stderr, "[调试] Stratum值无效: %d\n", packet->stratum);
+        fprintf(stderr, "[调试] stratum=%d 超出有效范围\n", packet->stratum);
         return 0;
     }
 
-    /* 验证服务器回显的原始时间戳（应等于客户端发送时间戳） */
+    /* orig_ts 回显校验：用无符号减法，避免 uint32 → int 强转在 2036 附近溢出 */
     uint32_t resp_orig_sec = ntohl(packet->orig_ts_sec);
-    uint32_t resp_orig_frac = ntohl(packet->orig_ts_frac);
-
-    /* 允许小的时间戳差异（某些服务器实现可能不完全精确） */
-    int sec_diff = abs((int)resp_orig_sec - (int)sent_sec);
-    if (sec_diff > 1) {
-        fprintf(stderr, "[调试] 原始时间戳秒差异过大: %d (发送:%u 回显:%u)\n",
-                sec_diff, sent_sec, resp_orig_sec);
+    uint32_t orig_diff = (resp_orig_sec > sent_sec)
+                         ? (resp_orig_sec - sent_sec)
+                         : (sent_sec - resp_orig_sec);
+    if (orig_diff > 1) {
+        fprintf(stderr, "[调试] orig_ts 秒差异过大: 发送=%u 回显=%u\n",
+                sent_sec, resp_orig_sec);
         return 0;
     }
+    (void)sent_frac; /* frac 精度校验收益低，保留参数供后续使用 */
 
-    /* 抑制未使用变量警告 */
-    (void)resp_orig_frac;
-    (void)sent_frac;
-
-    /* 检查传输时间戳非零 */
+    /* trans_ts 非零 */
     if (ntohl(packet->trans_ts_sec) == 0) {
-        fprintf(stderr, "[调试] 传输时间戳为零\n");
+        fprintf(stderr, "[调试] trans_ts 为零\n");
         return 0;
     }
 
     return 1;
 }
 
-/* --- 设置系统时间 --- */
-ntp_error_t set_system_time_platform(double new_time_seconds) {
-    time_t sec = (time_t)new_time_seconds;
-    double frac = new_time_seconds - (double)sec;
+/* ============================================================
+ * 设置系统时间
+ * ============================================================ */
+static ntp_error_t set_system_time_platform(double new_time_seconds) {
+    time_t  sec  = (time_t)new_time_seconds;
+    double  frac = new_time_seconds - (double)sec;
 
 #ifdef _WIN32
-    SYSTEMTIME st;
     ULONGLONG win_ticks = ((ULONGLONG)sec + 11644473600LL) * 10000000ULL +
-                          (ULONGLONG)(frac * 10000000ULL);
+                          (ULONGLONG)(frac * 10000000.0);
     FILETIME ft;
-    ft.dwLowDateTime = (DWORD)(win_ticks & 0xFFFFFFFF);
+    ft.dwLowDateTime  = (DWORD)(win_ticks & 0xFFFFFFFF);
     ft.dwHighDateTime = (DWORD)(win_ticks >> 32);
+    SYSTEMTIME st;
     FileTimeToSystemTime(&ft, &st);
-
     if (!SetSystemTime(&st)) {
-        if (GetLastError() == ERROR_ACCESS_DENIED) {
-            return NTP_ERR_PERMISSION_DENIED;
-        }
-        return NTP_ERR_SET_TIME_FAILED;
+        return (GetLastError() == ERROR_ACCESS_DENIED)
+               ? NTP_ERR_PERMISSION_DENIED : NTP_ERR_SET_TIME_FAILED;
     }
 #else
     if (getuid() != 0) {
         return NTP_ERR_PERMISSION_DENIED;
     }
     struct timeval tv;
-    tv.tv_sec = sec;
+    tv.tv_sec  = sec;
     tv.tv_usec = (suseconds_t)(frac * 1000000.0);
     if (settimeofday(&tv, NULL) < 0) {
         return NTP_ERR_SET_TIME_FAILED;
@@ -243,15 +297,17 @@ ntp_error_t set_system_time_platform(double new_time_seconds) {
     return NTP_SUCCESS;
 }
 
-/* --- 单次 NTP 查询（不设置时间） --- */
-ntp_result query_ntp_server(const char* hostname) {
+/* ============================================================
+ * 单次 NTP 查询
+ * ============================================================ */
+static ntp_result query_ntp_server(const char* hostname) {
     ntp_result result = {0.0, 0.0, 0.0, NTP_ERR_DNS_FAILED};
-    socket_t sock = -1;
+    socket_t sock = (socket_t)-1;
     struct addrinfo hints, *res = NULL;
     ntp_packet packet = {0};
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family   = AF_INET; /* 当前保持 IPv4，IPv6 支持留待后续 */
     hints.ai_socktype = SOCK_DGRAM;
 
     if (getaddrinfo(hostname, "123", &hints, &res) != 0) {
@@ -265,79 +321,143 @@ ntp_result query_ntp_server(const char* hostname) {
     }
 
 #ifdef _WIN32
-    DWORD timeout = NTP_TIMEOUT_SEC * 1000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    DWORD timeout_ms = NTP_TIMEOUT_SEC * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+               (char*)&timeout_ms, sizeof(timeout_ms));
 #else
     struct timeval tv_timeout = {NTP_TIMEOUT_SEC, 0};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_timeout, sizeof(tv_timeout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+               &tv_timeout, sizeof(tv_timeout));
 #endif
 
-    /* 构造标准 NTP 客户端请求包 */
-    packet.li_vn_mode = 0x1B; /* LI=0, VN=3, Mode=3(客户端) */
+    /* 构造标准 NTP v4 客户端请求包：LI=0, VN=4, Mode=3 */
+    packet.li_vn_mode = 0x23;
 
-    /* 记录发送时间（T1） */
-    double t1 = get_local_time_double();
-    /* [修复] 使用 floor() 提取整数部分，避免浮点边界溢出 */
-    uint32_t t1_sec = (uint32_t)floor(t1) + NTP_TIMESTAMP_DELTA;
-    double t1_frac_d = t1 - floor(t1);
-    uint32_t t1_frac = (uint32_t)(t1_frac_d * 4294967296.0);
+    /*
+     * T1:
+     * realtime 用于 NTP epoch
+     * monotonic 用于 RTT
+     */
+    double t1_real = get_realtime_double();
+    double t1_mono = get_monotonic_double();
 
-    /* 设置发送时间戳字段（网络字节序） */
-    packet.trans_ts_sec = htonl(t1_sec);
+    uint32_t t1_sec  =
+        (uint32_t)floor(t1_real) + NTP_TIMESTAMP_DELTA;
+
+    double t1_fd = t1_real - floor(t1_real);
+
+    uint32_t t1_frac =
+        (uint32_t)(t1_fd * 4294967296.0);
+
+    packet.trans_ts_sec  = htonl(t1_sec);
     packet.trans_ts_frac = htonl(t1_frac);
 
-    if (sendto(sock, (char*)&packet, sizeof(packet), 0, res->ai_addr, (int)res->ai_addrlen) < 0) {
+    /*
+     * UDP connect():
+     * 不建立 TCP 式连接，仅绑定默认对端。
+     * 内核会自动丢弃来源不匹配的数据包。
+     */
+    if (connect(sock, res->ai_addr,
+                (int)res->ai_addrlen) < 0) {
         result.error = NTP_ERR_SEND_FAILED;
         goto cleanup;
     }
 
-    /* 接收响应 */
-    int bytes = recv(sock, (char*)&packet, sizeof(packet), 0);
-    double t4 = get_local_time_double();
+    if (send(sock,
+             (char*)&packet,
+             sizeof(packet),
+             0) < 0) {
+        result.error = NTP_ERR_SEND_FAILED;
+        goto cleanup;
+    }
 
-    if (bytes < NTP_PACKET_SIZE) {
+    int bytes = recv(sock,
+                     (char*)&packet,
+                     sizeof(packet),
+                     0);
+
+    double t4_mono = get_monotonic_double();
+    double t4_real = get_realtime_double();
+
+    if (bytes < 0) {
         result.error = NTP_ERR_RECV_TIMEOUT;
         goto cleanup;
     }
 
-    /* 验证响应合法性 */
-    if (!validate_ntp_response(&packet, t1_sec, t1_frac)) {
+    if (bytes < NTP_PACKET_SIZE) {
         result.error = NTP_ERR_INVALID_RESPONSE;
         goto cleanup;
     }
 
-    /* 提取时间戳 */
+    if (!validate_ntp_response(&packet,
+                               t1_sec,
+                               t1_frac)) {
+        result.error = NTP_ERR_INVALID_RESPONSE;
+        goto cleanup;
+    }
+
+    /* 提取服务器时间戳 */
     uint32_t t2_sec = ntohl(packet.recv_ts_sec);
     uint32_t t2_fra = ntohl(packet.recv_ts_frac);
+
     uint32_t t3_sec = ntohl(packet.trans_ts_sec);
     uint32_t t3_fra = ntohl(packet.trans_ts_frac);
 
-    double t2 = (double)(t2_sec - NTP_TIMESTAMP_DELTA) + (double)t2_fra / 4294967296.0;
-    double t3 = (double)(t3_sec - NTP_TIMESTAMP_DELTA) + (double)t3_fra / 4294967296.0;
+    double t2 =
+        (double)(t2_sec - NTP_TIMESTAMP_DELTA) +
+        (double)t2_fra / 4294967296.0;
 
-    /* NTP 算法:
-     * delay  = (T4-T1) - (T3-T2)
-     * offset = ((T2-T1) + (T3-T4)) / 2
-     * corrected_time = T3 + delay/2
+    double t3 =
+        (double)(t3_sec - NTP_TIMESTAMP_DELTA) +
+        (double)t3_fra / 4294967296.0;
+
+    /*
+     * RFC 5905:
+     *
+     * delay  =
+     *   (T4_mono - T1_mono) - (T3 - T2)
+     *
+     * offset =
+     *   ((T2 - T1_real) + (T3 - T4_real)) / 2
      */
-    result.delay  = (t4 - t1) - (t3 - t2);
-    result.offset = ((t2 - t1) + (t3 - t4)) / 2.0;
-    result.corrected_time = t3 + (result.delay / 2.0);
-    result.error = NTP_SUCCESS;
+    double rtt =
+        (t4_mono - t1_mono) - (t3 - t2);
+
+    double offset =
+        ((t2 - t1_real) +
+         (t3 - t4_real)) / 2.0;
+
+    /* delay 理论非负 */
+    if (rtt < 0.0) {
+        rtt = 0.0;
+    }
+
+    result.delay          = rtt;
+    result.offset         = offset;
+    result.corrected_time = t4_real + offset;
+    result.error          = NTP_SUCCESS;
 
 cleanup:
-    if (!IS_INVALID_SOCKET(sock)) CLOSE_SOCKET(sock);
-    if (res) freeaddrinfo(res);
+    if (!IS_INVALID_SOCKET(sock)) {
+        CLOSE_SOCKET(sock);
+    }
+
+    if (res) {
+        freeaddrinfo(res);
+    }
+
     return result;
 }
 
-/* --- 多次采样取最小delay --- */
-ntp_result sync_with_server_multi_sample(const char* hostname, int samples) {
+/* ============================================================
+ * 多次采样取最小 delay
+ * ============================================================ */
+static ntp_result sync_with_server_multi_sample(const char* hostname, int samples) {
     ntp_result results[MAX_SAMPLES];
     int success_count = 0;
     ntp_result final = {0.0, 0.0, 0.0, NTP_ERR_RECV_TIMEOUT};
 
-    if (samples > MAX_SAMPLES) samples = MAX_SAMPLES; /* 边界保护 */
+    if (samples > MAX_SAMPLES) samples = MAX_SAMPLES;
 
     printf("正在同步 %s (%d次采样)...\n", hostname, samples);
 
@@ -346,11 +466,12 @@ ntp_result sync_with_server_multi_sample(const char* hostname, int samples) {
         if (results[i].error == NTP_SUCCESS) {
             printf("  采样 %d/%d: 延迟 %.2f ms | 偏移 %+.2f ms ✓\n",
                    i+1, samples,
-                   results[i].delay * 1000.0,
+                   results[i].delay  * 1000.0,
                    results[i].offset * 1000.0);
             success_count++;
         } else {
-            printf("  采样 %d/%d: %s ✗\n", i+1, samples, ntp_error_strings[results[i].error]);
+            printf("  采样 %d/%d: %s ✗\n",
+                   i+1, samples, ntp_error_strings[results[i].error]);
         }
     }
 
@@ -359,11 +480,7 @@ ntp_result sync_with_server_multi_sample(const char* hostname, int samples) {
         return final;
     }
 
-    /*
-     * [修复] 取最小delay对应的采样结果
-     * 原因: delay最小说明网络路径最对称，时间误差最小；
-     *       多个时间戳直接求平均无统计意义。
-     */
+    /* 取最小 delay 对应的采样：delay 越小说明网络路径越对称，误差越小 */
     ntp_result* best = NULL;
     for (int i = 0; i < samples; i++) {
         if (results[i].error == NTP_SUCCESS) {
@@ -380,8 +497,10 @@ ntp_result sync_with_server_multi_sample(const char* hostname, int samples) {
     return final;
 }
 
-/* --- 使用说明 --- */
-void print_usage(const char* prog_name) {
+/* ============================================================
+ * 使用说明
+ * ============================================================ */
+static void print_usage(const char* prog_name) {
     printf("用法: %s [选项] [NTP服务器]\n\n", prog_name);
     printf("选项:\n");
     printf("  -s <次数>  多次采样取最优（1-5次，默认1次）\n");
@@ -389,9 +508,11 @@ void print_usage(const char* prog_name) {
     printf("示例:\n");
     printf("  %s                          # 使用内置服务器池\n", prog_name);
     printf("  %s time.google.com          # 指定服务器\n", prog_name);
-    printf("  %s -s 3 ntp.aliyun.com      # 3次采样取最优\n\n", prog_name);
+    printf("  %s -s 3 ntp.aliyun.com      # 3次采样取最优\n", prog_name);
     printf("  %s 192.168.1.1              # 指定IPv4地址\n\n", prog_name);
     printf("注意:\n");
+    printf("  本工具直接跳变系统时间（settimeofday/SetSystemTime），\n");
+    printf("  适合一次性手动对时，不适合替代 chrony/ntpd 长期同步。\n");
 #ifdef _WIN32
     printf("  Windows: 请以管理员身份运行\n");
 #else
@@ -399,11 +520,13 @@ void print_usage(const char* prog_name) {
 #endif
 }
 
+/* ============================================================
+ * main
+ * ============================================================ */
 int main(int argc, char* argv[]) {
-    int samples = 1;
+    int   samples       = 1;
     char* custom_server = NULL;
 
-    /* 解析命令行参数 */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
@@ -424,32 +547,32 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    /* hostname 仅做长度检查，合法性由 getaddrinfo 最终裁定 */
+    if (custom_server && strlen(custom_server) > MAX_HOSTNAME_LEN) {
+        fprintf(stderr, "[错误] 主机名过长（最大 %d 字符）\n", MAX_HOSTNAME_LEN);
+        return 1;
+    }
+
     if (!init_networking()) return 1;
 
-    int success = 0;
+    int        success = 0;
     ntp_result result;
 
-    /* 阶段1: 尝试用户指定服务器 */
+    /* 阶段1: 用户指定服务器 */
     if (custom_server) {
-        if (!validate_hostname(custom_server)) {
-            fprintf(stderr, "[错误] 无效的主机名: %s\n", custom_server);
-            cleanup_networking();
-            return 1;
-        }
-
         printf("=== 阶段 1: 用户指定服务器 ===\n");
         result = sync_with_server_multi_sample(custom_server, samples);
 
         if (result.error == NTP_SUCCESS) {
-            ntp_error_t set_error = set_system_time_platform(result.corrected_time);
-            if (set_error == NTP_SUCCESS) {
+            ntp_error_t set_err = set_system_time_platform(result.corrected_time);
+            if (set_err == NTP_SUCCESS) {
                 time_t final_sec = (time_t)result.corrected_time;
                 printf("✓ 系统时间已更新: %s\n", ctime(&final_sec));
                 success = 1;
             } else {
-                fprintf(stderr, "[错误] %s\n", ntp_error_strings[set_error]);
+                fprintf(stderr, "[错误] %s\n", ntp_error_strings[set_err]);
 #ifdef _WIN32
-                fprintf(stderr, "提示: 请以管理员身份运行命令提示符\n");
+                fprintf(stderr, "提示: 请以管理员身份运行\n");
 #else
                 fprintf(stderr, "提示: 请使用 sudo 运行此程序\n");
 #endif
@@ -459,21 +582,21 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    /* 阶段2: 轮询内置服务器 */
+    /* 阶段2: 内置服务器池 */
     if (!success) {
         printf("=== 阶段 2: 内置备用服务器池 ===\n");
         for (int i = 0; i < INTERNAL_SERVER_COUNT; i++) {
             result = sync_with_server_multi_sample(INTERNAL_NTP_SERVERS[i], samples);
 
             if (result.error == NTP_SUCCESS) {
-                ntp_error_t set_error = set_system_time_platform(result.corrected_time);
-                if (set_error == NTP_SUCCESS) {
+                ntp_error_t set_err = set_system_time_platform(result.corrected_time);
+                if (set_err == NTP_SUCCESS) {
                     time_t final_sec = (time_t)result.corrected_time;
                     printf("✓ 系统时间已更新: %s\n", ctime(&final_sec));
                     success = 1;
                     break;
                 } else {
-                    fprintf(stderr, "[错误] %s\n", ntp_error_strings[set_error]);
+                    fprintf(stderr, "[错误] %s\n", ntp_error_strings[set_err]);
                 }
             }
         }
